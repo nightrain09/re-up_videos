@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# Credentials - KHÔNG push lên Git!
+service-account.json
+tokens.json
+
+# Model files (dung lượng lớn)
+rvc/**/*.pth
+rvc/**/*.index
+
+# Output & Temp
+final_output/
+Tasks/
+tmp_*.wav
+tmp_*.mp3
+downloaded_videos/
+tts_cache/
+
+# Test media
+*.mp4
+*.wav
+*.mp3
+
+# Build
+dist/
+*.spec
+*.zip
+
+getTransToken.py
+checkAuth.py
+TokenManager.py
+tokens.json
+trans.py
+transfile.py
