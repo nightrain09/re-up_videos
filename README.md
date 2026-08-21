@@ -89,7 +89,7 @@ GEMINI_MODELS=gemini-2.0-flash,gemini-3.1-flash-lite-preview,gemma-3-27b-it
 
 ### CapCut TTS (TikTok giọng đọc)
 Project sử dụng CapCut TTS để lấy giọng đọc TikTok. Đây là một server riêng chạy bằng Node.js, cần được cài đặt và chạy song song.
-
+https://github.com/kuwacom/CapCut-TTS.git
 #### Cài đặt CapCut TTS
 ```bash
 cd CapCut-TTS
