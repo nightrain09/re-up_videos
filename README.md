@@ -1,7 +1,8 @@
 # reupvideo
 
-Công cụ tạo lại video ngắn từ danh sách link hoặc video local: nhận dạng lời thoại, dịch sang tiếng Việt, lồng tiếng và render video có phụ đề.
+Tải phim ngắn từ Douyin, các video nước ngoài, và dịch thuật tự động, kèm lồng tiếng, nhiều lựa chọn giọng đọc và phong cách, tự động hoàn toàn và chạy được hàng loạt
 
+Phục vụ cac bạn làm về mảng xây kênh tiktok, xây kênh reels, xây kênh youtube
 ## Xem trước
 
 Ví dụ `links.txt`:
@@ -63,8 +64,8 @@ npm run dev
 Server chạy tại `http://localhost:8080`. Với RVC native, cài thêm `pip install rvc-python`; với RVC docker, cần Docker. Google Cloud TTS cần `service-account.json` trong thư mục gốc.
 
 ## Cách dùng
-
-1. Tạo `links.txt`, mỗi dòng một link hoặc đường dẫn video local.
+0. Vào CapCupTTS/ env, diền thông tin của bạn vào để có thể lấy giọng đọc capcut
+1. Tạo `links.txt` hoặc bất cứ file nào chứa link video cần tải, mỗi dòng một link hoặc đường dẫn video local.
 2. Mở ứng dụng, chọn file này ở mục `Danh sách link / video`.
 3. Đặt `Bắt đầu từ` và `Song song`, chỉnh các tab cấu hình.
 4. Bấm `Bắt đầu chạy hàng loạt`.
@@ -93,7 +94,6 @@ python gemini_trans.py --input stt_raw.txt --output filtered.txt --lang zh --max
 |------|-------|----------|----------|
 | `GEMINI_API_KEYS` | Danh sách key Gemini, cách nhau dấu phẩy | Không | Có nếu dùng Gemini |
 | `GEMINI_MODELS` | Danh sách model Gemini, cách nhau dấu phẩy | Không | Có nếu dùng Gemini |
-| `VIETPHRASE_DEFAULT_TOKEN` | Token VietPhrase cho chế độ Bộ lọc | Rỗng | Có nếu dùng Bộ lọc |
 
 ### Tùy chọn chính trong `automation_config.json`
 
@@ -120,19 +120,3 @@ Các trường còn lại như blur, font, màu, PNG, cắt video và RVC đư�
 
 Sửa cấu hình: chỉnh trên giao diện rồi bấm `Lưu cấu hình`, hoặc đóng app, sửa `automation_config.json` rồi mở lại. Để dùng nhiều bộ cấu hình, dùng `Xuất config` và `Nhập config`.
 
-## Cấu trúc
-
-- `AutomationApp.py`: giao diện PyQt6.
-- `MainController.py`: điều phối các bước xử lý.
-- `stt.py`: nhận dạng giọng nói bằng faster-whisper.
-- `gemini_trans.py`: dịch Gemini, kiểm tra định dạng và retry.
-- `filter.py`: bộ lọc xưng hô cho chế độ Bộ lọc.
-- `pre_process_video.py`: tiền xử lý video.
-- `subVideo_gg.py`: render với Edge, gTTS, Google Cloud, TikTok.
-- `subVideo_rvc.py`: render với RVC.
-- `subVideo_vietNeu.py`: render với VieNeu.
-- `subVideo_png_overlay.py`: chèn ảnh PNG.
-- `utils/`: thư viện dùng chung.
-- `CapCut-TTS/`: server TTS cho giọng TikTok.
-- `automation_config.example.json`: mẫu cấu hình đầy đủ.
-- `requirements.txt`: thư viện Python.
