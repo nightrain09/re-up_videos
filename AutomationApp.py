@@ -7,6 +7,7 @@ import sys
 import os
 import json
 import shutil
+import threading
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -20,6 +21,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRect, QSize
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from MainController import MainController
+from utils.task_progress import fingerprint_config, source_identity
 
 
 CONFIG_FILE = "automation_config.json"
@@ -357,9 +359,36 @@ class AutomationWorker(QThread):
         super().__init__()
         self.config = config
         self.controller = controller
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _task_is_complete(self, task_id, source_path):
+        """Output cuối đã xong và đúng config hiện tại hay chưa."""
+        final_name = os.path.join(self.controller.OutputDir, f"{task_id}.mp4")
+        if not self.controller._video_ready(final_name):
+            return False
+
+        try:
+            with open(final_name + ".meta.json", "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            # Output từ bản cũ chưa có meta -> coi như đã xong.
+            return True
+
+        if meta.get("config_fingerprint") != fingerprint_config(self.config):
+            return False
+
+        current_source = source_identity(source_path) if source_path else {}
+        old_source = meta.get("source") or {}
+        if current_source and old_source and current_source != old_source:
+            return False
+        return True
 
     def process_one_video(self, task_id, local_path):
         cfg = self.config
+        config_fp = fingerprint_config(cfg)
         try:
             result_path = self.controller.ExecuteWorkflow(
                 VideoUrl=local_path,
@@ -388,6 +417,7 @@ class AutomationWorker(QThread):
                 RenderDevice=cfg['render_device'],
                 RvcMode=cfg['rvc_mode'],
                 SttDevice=cfg.get('stt_device', 'cuda'),
+                SttWorkers=cfg['max_concurrent'],
                 SubtitlePosition=cfg.get('subtitle_position', 'duoi_giua'),
                 FontSize=cfg.get('font_size', 32),
                 MarginV=cfg.get('margin_v', 40),
@@ -414,12 +444,19 @@ class AutomationWorker(QThread):
                 PngEndTime=cfg.get('png_end_time', 0),
                 PngFullVideo=cfg.get('png_full_video', False),
                 HasSubtitle=cfg.get('has_subtitle', True),
+                ConfigFingerprint=config_fp,
             )
             if result_path and os.path.exists(result_path):
                 final_name = os.path.join(self.controller.OutputDir, f"{task_id}.mp4")
+                final_meta = final_name + ".meta.json"
+                result_meta = result_path + ".meta.json"
                 if os.path.exists(final_name):
                     os.remove(final_name)
-                os.rename(result_path, final_name)
+                if os.path.exists(final_meta):
+                    os.remove(final_meta)
+                os.replace(result_path, final_name)
+                if os.path.exists(result_meta):
+                    os.replace(result_meta, final_meta)
                 self.LogSignal.emit(f"OK {task_id} -> {final_name}")
                 return True
             else:
@@ -444,23 +481,50 @@ class AutomationWorker(QThread):
         self.LogSignal.emit(f"=== GIAI ĐOẠN 1: Kiểm tra {total} video (local/online) ===")
 
         downloaded = []
+        skipped_done = 0
         for i, url in enumerate(urls):
+            if self._stop_event.is_set():
+                self.LogSignal.emit("Đã yêu cầu dừng, không nhận thêm task mới.")
+                break
+
             task_id = f"tap{cfg['start_index'] + i}"
             out_path = os.path.join(download_dir, f"{task_id}.mp4")
 
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                self.LogSignal.emit(f"[{i+1}/{total}] Bỏ qua {task_id} (đã có trong download_dir)")
-                downloaded.append((task_id, out_path))
+            # Task đã hoàn tất với đúng config hiện tại -> bỏ qua hẳn.
+            if self._task_is_complete(task_id, out_path if os.path.exists(out_path) else None):
+                self.LogSignal.emit(f"[{i+1}/{total}] Bỏ qua {task_id} (đã hoàn tất)")
+                skipped_done += 1
                 continue
+
+            if os.path.exists(out_path):
+                if not self.controller._video_ready(out_path):
+                    self.LogSignal.emit(f"[{i+1}/{total}] {task_id}: file tải dở/hỏng -> tải lại")
+                    try:
+                        os.remove(out_path)
+                    except OSError:
+                        pass
+                else:
+                    self.LogSignal.emit(f"[{i+1}/{total}] Bỏ qua {task_id} (đã có trong download_dir)")
+                    downloaded.append((task_id, out_path))
+                    continue
 
             if os.path.exists(url):
                 self.LogSignal.emit(f"[{i+1}/{total}] Copy local {task_id}: {url}")
+                tmp_copy = out_path + ".part.mp4"
                 try:
-                    shutil.copy2(url, out_path)
+                    shutil.copy2(url, tmp_copy)
+                    if not self.controller._video_ready(tmp_copy):
+                        raise RuntimeError("video copy khong hop le")
+                    os.replace(tmp_copy, out_path)
                     self.LogSignal.emit(f"[{i+1}/{total}] OK {task_id} (local)")
                     downloaded.append((task_id, out_path))
                 except Exception as e:
                     self.LogSignal.emit(f"[{i+1}/{total}] LỖI copy {task_id}: {e}")
+                    for path in (tmp_copy, out_path):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
                 continue
 
             self.LogSignal.emit(f"[{i+1}/{total}] Đang tải {task_id}...")
@@ -472,12 +536,16 @@ class AutomationWorker(QThread):
                 self.LogSignal.emit(f"[{i+1}/{total}] THẤT BẠI {task_id}")
 
         self.LogSignal.emit(f"\n=== GIAI ĐOẠN 2: Xử lý {len(downloaded)} video (song song={cfg['max_concurrent']}) ===")
-        success = 0
+        if skipped_done:
+            self.LogSignal.emit(f"Đã bỏ qua {skipped_done} task hoàn tất từ lần chạy trước.")
+        success = skipped_done
         completed = 0
 
         with ThreadPoolExecutor(max_workers=cfg['max_concurrent']) as executor:
             future_map = {}
             for task_id, local_path in downloaded:
+                if self._stop_event.is_set():
+                    break
                 future = executor.submit(self.process_one_video, task_id, local_path)
                 future_map[future] = task_id
 
@@ -1822,7 +1890,7 @@ class AutomationWindow(QMainWindow):
         if self.custom_font_path:
             font_name = self.custom_font_path
 
-        return {
+        cfg = {
             "file_path": self.FilePathInput.text().strip(),
             "start_index": self.StartIndexSpin.value(),
             "max_concurrent": self.ParallelSpin.value(),
@@ -1875,6 +1943,10 @@ class AutomationWindow(QMainWindow):
             "png_full_video": self.PngFullVideoCheck.isChecked(),
             "has_subtitle": self.HasSubtitleCheck.isChecked(),
         }
+        # Key nay khong co tren UI: giu gia tri nguoi dung sua truc tiep trong JSON,
+        # tranh bi ghi de moi lan Save/dong app.
+        cfg["gemini_max_retries"] = self.saved_config.get("gemini_max_retries", 5)
+        return cfg
 
     def RestoreConfig(self):
         c = self.saved_config
@@ -2050,10 +2122,12 @@ class AutomationWindow(QMainWindow):
             return
         if config["voice_type"] == "GTTS" or (config["voice_type"] == "RVC" and config["rvc_base"] == "NEUTRAL"):
             if not os.path.exists("service-account.json"):
-                QMessageBox.critical(self, "Thiếu Token",
-                                     "Không tìm thấy file 'service-account.json'!\n"
-                                     "Cần file này cho Google Cloud TTS.")
-                return
+                # Vẫn cho workflow resume: task đã render xong không cần token.
+                # Controller chỉ kiểm tra token nếu thật sự phải chạy lại B4.
+                self.LogArea.append(
+                    "CẢNH BÁO: chưa có service-account.json; "
+                    "các task cần chạy mới bước render Google TTS sẽ tạm lỗi."
+                )
 
         self.BtnStart.setEnabled(False)
         self.BtnStart.setText("⏳  ĐANG XỬ LÝ...")
@@ -2074,6 +2148,23 @@ class AutomationWindow(QMainWindow):
         QMessageBox.information(self, "Hoàn tất", f"Xử lý xong {success}/{total} video!")
 
     def closeEvent(self, event):
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            reply = QMessageBox.question(
+                self, "Đang xử lý",
+                "Đang xử lý video. Dừng và thoát?\n"
+                "Tiến độ đã được lưu; lần sau bấm Bắt đầu sẽ chạy tiếp.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.LogArea.append("Đang dừng tiến trình con và lưu tiến độ...")
+            worker.stop()
+            self.controller.terminate_children()
+            worker.wait(5000)
+
         try:
             save_config(self.GetCurrentConfig())
         except:

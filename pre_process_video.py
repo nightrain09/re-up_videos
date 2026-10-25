@@ -15,6 +15,8 @@ def pre_process(task_dir, mode='duck', bgm_file=None, speed=1.0, max_fps=60, qua
                 brightness=0, cut_start=0, cut_end=0):
     input_path = os.path.join(task_dir, "original_video.mp4")
     output_path = os.path.join(task_dir, "cleaned_video.mp4")
+    # Giữ đuôi .mp4 để ffmpeg chọn đúng muxer; chỉ replace khi đã xong.
+    tmp_output_path = os.path.join(task_dir, "cleaned_video.part.mp4")
 
     if not os.path.exists(input_path):
         logging.error(f"Khong tim thay video goc tai: {input_path}")
@@ -117,7 +119,7 @@ def pre_process(task_dir, mode='duck', bgm_file=None, speed=1.0, max_fps=60, qua
         "-bufsize", codec_cfg.get("bufsize", "16M"),
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-map_metadata", "-1",
-        output_path
+        tmp_output_path
     ]
 
     try:
@@ -129,12 +131,20 @@ def pre_process(task_dir, mode='duck', bgm_file=None, speed=1.0, max_fps=60, qua
         subprocess.run(ffmpeg_cmd, check=True)
 
         # Binary padding for MD5 bypass
-        with open(output_path, "ab") as f:
+        with open(tmp_output_path, "ab") as f:
             f.write(os.urandom(random.randint(100, 500)))
+            f.flush()
+            os.fsync(f.fileno())
 
+        os.replace(tmp_output_path, output_path)
         logging.info(f"Da tao video sach tai: {output_path}")
         return True
     except Exception as e:
+        if os.path.exists(tmp_output_path):
+            try:
+                os.remove(tmp_output_path)
+            except OSError:
+                pass
         logging.error(f"Loi tien xu ly: {e}")
         return False
 

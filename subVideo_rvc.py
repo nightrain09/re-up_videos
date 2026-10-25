@@ -7,6 +7,7 @@ import re
 import argparse
 import shutil
 import asyncio
+import hashlib
 from datetime import datetime
 from pydub import AudioSegment
 from pydub.effects import normalize
@@ -17,6 +18,12 @@ from gtts import gTTS
 from utils.audio import speed_change, trim_silence
 from utils.subtitle import parse_txt, ms_to_ass_time, generate_ass
 from utils.ffmpeg import get_video_duration, get_codec_config
+from utils.task_progress import (
+    empty_progress,
+    get_stage,
+    load_progress_file,
+    save_progress_file,
+)
 
 # Cau hinh
 KEY_PATH = "service-account.json"
@@ -56,10 +63,18 @@ def init_google_client():
             raise e
 
 
+def _tts_part_path(path):
+    base, ext = os.path.splitext(path)
+    return f"{base}.tmp{ext}"
+
+
 async def generate_tts_safe(text, output_path, semaphore):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
+            tmp_path = _tts_part_path(output_path)
             try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
                 success = False
                 if SELECT_TYPE in ["CHIRP", "NEUTRAL"]:
                     if not client:
@@ -76,27 +91,38 @@ async def generate_tts_safe(text, output_path, semaphore):
                         None, lambda: client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
                     )
                     if response.audio_content:
-                        with open(output_path, "wb") as out:
+                        with open(tmp_path, "wb") as out:
                             out.write(response.audio_content)
+                            out.flush()
+                            os.fsync(out.fileno())
                         success = True
 
                 elif SELECT_TYPE == "EDGE":
                     communicate = edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE)
-                    await communicate.save(output_path)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    await communicate.save(tmp_path)
+                    if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                         success = True
 
                 elif SELECT_TYPE == "GTTS":
                     loop = asyncio.get_event_loop()
                     tts = gTTS(text=text, lang='vi')
-                    await loop.run_in_executor(None, lambda: tts.save(output_path))
+                    await loop.run_in_executor(None, lambda: tts.save(tmp_path))
                     success = True
 
                 if success:
+                    os.replace(tmp_path, output_path)
                     return True
+
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
                 await asyncio.sleep(min(2 * (attempt + 1), 10))
 
             except Exception as e:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
                 if "429" in str(e):
                     await asyncio.sleep(10)
                 else:
@@ -106,13 +132,41 @@ async def generate_tts_safe(text, output_path, semaphore):
         return False
 
 
-async def run_tts_batch(subs, raw_p):
+async def run_tts_batch(subs, raw_p, progress=None, progress_file=None):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
     ext = ".wav" if SELECT_TYPE in ["CHIRP", "NEUTRAL"] and AUDIO_ENCODING == texttospeech.AudioEncoding.LINEAR16 else ".mp3"
+    render = get_stage(progress, "render") if progress is not None else None
+    tts_done = set(render.get("tts_done") or []) if render is not None else set()
+
+    def _line_path(index):
+        return os.path.join(raw_p, f"{index}{ext}")
+
+    def _ready(index):
+        path = _line_path(index)
+        return os.path.exists(path) and os.path.getsize(path) > 100
+
     for i in range(0, len(subs), CHUNK_SIZE):
-        chunk = subs[i: i + CHUNK_SIZE]
-        tasks = [generate_tts_safe(sub['text'], os.path.join(raw_p, f"{i + j}{ext}"), semaphore) for j, sub in enumerate(chunk)]
-        await asyncio.gather(*tasks)
+        end = min(i + CHUNK_SIZE, len(subs))
+        tasks = []
+        for index in range(i, end):
+            if _ready(index):
+                tts_done.add(index)
+                continue
+            tasks.append(generate_tts_safe(subs[index]['text'], _line_path(index), semaphore))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        for index in range(i, end):
+            if _ready(index):
+                tts_done.add(index)
+
+        if render is not None:
+            render["tts_done"] = sorted(tts_done)
+            render["tts_total"] = len(subs)
+            if progress_file:
+                save_progress_file(progress_file, progress)
+
         await asyncio.sleep(0.5)
 
 
@@ -130,7 +184,7 @@ def process_rvc_sub(task_dir, rvc_model_name, bgm_file, blur_sub, final_output_p
                     blur_start_percent=80, blur_end_percent=95, blur_intensity=10,
                     aspect_ratio="auto", font_name="Arial",
                     font_color="#FFFF00", outline_color="#000000", back_color="#80000000", bold=True,
-                    sub_background=True, has_subtitle=True):
+                    sub_background=True, has_subtitle=True, progress_file=None):
     task_dir = os.path.abspath(task_dir)
     video_in = os.path.join(task_dir, "original_video.mp4")
     txt_in = sub_file if sub_file else os.path.join(task_dir, "translated.txt")
@@ -146,8 +200,27 @@ def process_rvc_sub(task_dir, rvc_model_name, bgm_file, blur_sub, final_output_p
     os.makedirs(raw_p, exist_ok=True)
     os.makedirs(rvc_p, exist_ok=True)
 
+    progress_file = progress_file or os.path.join(task_dir, "progress.json")
+    progress = load_progress_file(progress_file) or empty_progress()
+    render = get_stage(progress, "render")
+    subs_hash = hashlib.sha256((
+        "\n".join(f"{s['start_ms']}|{s['text']}" for s in subs)
+        + f"|{SELECT_TYPE}|{EDGE_VOICE}|{NEUTRAL_VOICE_ID}|{DVOICE_RATE}|{EDGE_RATE}"
+          f"|{PITCH}|{speed}|{f0_key}|{rvc_model_name}|{rvc_mode}"
+    ).encode("utf-8")).hexdigest()
+    if render.get("subs_hash") and render.get("subs_hash") != subs_hash:
+        print("[RESUME] Subtitle/voice thay doi -> tao lai TTS/RVC.")
+        shutil.rmtree(raw_p, ignore_errors=True)
+        shutil.rmtree(rvc_p, ignore_errors=True)
+        os.makedirs(raw_p, exist_ok=True)
+        os.makedirs(rvc_p, exist_ok=True)
+        render.clear()
+    render["subs_hash"] = subs_hash
+    render["done"] = False
+    save_progress_file(progress_file, progress)
+
     # Step 1: Generate base TTS
-    asyncio.run(run_tts_batch(subs, raw_p))
+    asyncio.run(run_tts_batch(subs, raw_p, progress, progress_file))
 
     ext = ".wav" if SELECT_TYPE in ["CHIRP", "NEUTRAL"] and AUDIO_ENCODING == texttospeech.AudioEncoding.LINEAR16 else ".mp3"
 
@@ -171,9 +244,20 @@ try:
     rvc.load_model('/app/model/{pth_file}')
     rvc.set_params(f0up_key={f0_key}, f0_method='rmvpe'{index_arg})
     input_dir, output_dir = '/app/input', '/app/output'
+    for name in os.listdir(output_dir):
+        if name.startswith('.tmp_'):
+            try:
+                os.remove(os.path.join(output_dir, name))
+            except OSError:
+                pass
     files = sorted([f for f in os.listdir(input_dir) if f.endswith('{ext}') and os.path.getsize(os.path.join(input_dir, f)) > 0], key=lambda x: int(x.split('.')[0]))
     for f in files:
-        rvc.infer_file(os.path.join(input_dir, f), os.path.join(output_dir, f))
+        dst = os.path.join(output_dir, f)
+        if os.path.exists(dst) and os.path.getsize(dst) > 100:
+            continue
+        tmp = os.path.join(output_dir, '.tmp_' + f)
+        rvc.infer_file(os.path.join(input_dir, f), tmp)
+        os.replace(tmp, dst)
         if '{device}' == 'cuda':
             torch.cuda.empty_cache(); gc.collect()
 except Exception as e:
@@ -203,11 +287,25 @@ except Exception as e:
 
             for i in range(len(subs)):
                 f_path = os.path.join(raw_p, f"{i}{ext}")
+                dst = os.path.join(rvc_p, f"{i}{ext}")
+                if os.path.exists(dst) and os.path.getsize(dst) > 100:
+                    continue
                 if os.path.exists(f_path) and os.path.getsize(f_path) > 0:
-                    rvc.infer_file(f_path, os.path.join(rvc_p, f"{i}{ext}"))
+                    tmp = os.path.join(rvc_p, f".tmp_{i}{ext}")
+                    rvc.infer_file(f_path, tmp)
+                    os.replace(tmp, dst)
         except ImportError:
             print("[RVC] Chua cai rvc-python. Chay: pip install rvc-python")
             return False
+
+    # Ghi nhận các dòng RVC đã xong (file là nguồn tin cậy cuối cùng).
+    render["rvc_done"] = sorted(
+        i for i in range(len(subs))
+        if os.path.exists(os.path.join(rvc_p, f"{i}{ext}"))
+        and os.path.getsize(os.path.join(rvc_p, f"{i}{ext}")) > 100
+    )
+    render["rvc_total"] = len(subs)
+    save_progress_file(progress_file, progress)
 
     # Step 3: Combine audio
     video_dur = get_video_duration(video_in)
@@ -307,7 +405,9 @@ except Exception as e:
             os.remove(p)
 
     if os.path.exists(video_tmp):
-        shutil.move(video_tmp, final_output_path)
+        os.replace(video_tmp, final_output_path)
+        render["done"] = True
+        save_progress_file(progress_file, progress)
         return True
     return False
 
@@ -347,6 +447,7 @@ if __name__ == "__main__":
     parser.add_argument("--blur_intensity", type=int, default=10, help="Độ đậm nhạt blur (0-20)")
     parser.add_argument("--sub_background", default="True", help="Bật/tắt nền phụ đề (True/False)")
     parser.add_argument("--has_subtitle", default="True", help="Co chay TTS+chen phu de hay khong (True/False)")
+    parser.add_argument("--progress", default=None, help="File progress.json cua task")
     args = parser.parse_args()
 
     engine_to_use = args.base_tts if args.base_tts else args.tts_engine
@@ -372,4 +473,5 @@ if __name__ == "__main__":
                     aspect_ratio=args.aspect_ratio, font_name=args.font_name,
                     font_color=args.font_color, outline_color=args.outline_color,
                     back_color=args.back_color,
-                    sub_background=sub_bg, has_subtitle=has_subtitle)
+                    sub_background=sub_bg, has_subtitle=has_subtitle,
+                    progress_file=args.progress)

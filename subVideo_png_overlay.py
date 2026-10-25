@@ -51,14 +51,29 @@ def apply_png_overlay(input_video, output_video, png_path, pos_x=50, pos_y=10,
         print(f"[PNG_OVERLAY] Khong tim thay video input: {input_video}")
         return False
 
+    # Ghi ra file tam roi replace de mat dien khong de lai output do.
+    tmp_output = output_video + ".part.mp4"
+
+    def _commit():
+        os.replace(tmp_output, output_video)
+        return True
+
+    def _cleanup():
+        if os.path.exists(tmp_output):
+            try:
+                os.remove(tmp_output)
+            except OSError:
+                pass
+
     # Neu khong co PNG hoac PNG khong ton tai -> copy input sang output nguyen ven
     if not png_path or not os.path.exists(png_path):
         print(f"[PNG_OVERLAY] Khong co file PNG hoac PNG khong ton tai. Copy input sang output (no-op).")
         try:
-            subprocess.run(["ffmpeg", "-y", "-i", input_video, "-c", "copy", output_video],
+            subprocess.run(["ffmpeg", "-y", "-i", input_video, "-c", "copy", tmp_output],
                            check=True, capture_output=True)
-            return True
+            return _commit()
         except Exception as e:
+            _cleanup()
             print(f"[PNG_OVERLAY] Loi copy video: {e}")
             return False
 
@@ -69,10 +84,11 @@ def apply_png_overlay(input_video, output_video, png_path, pos_x=50, pos_y=10,
     if vw is None or vh is None:
         print(f"[PNG_OVERLAY] Khong the doc kich thuoc video. Copy input sang output.")
         try:
-            subprocess.run(["ffmpeg", "-y", "-i", input_video, "-c", "copy", output_video],
+            subprocess.run(["ffmpeg", "-y", "-i", input_video, "-c", "copy", tmp_output],
                            check=True, capture_output=True)
-            return True
+            return _commit()
         except Exception as e:
+            _cleanup()
             print(f"[PNG_OVERLAY] Loi copy video: {e}")
             return False
 
@@ -121,22 +137,25 @@ def apply_png_overlay(input_video, output_video, png_path, pos_x=50, pos_y=10,
         "-preset", "p4" if codec == "h264_nvenc" else "medium",
         "-cq", "23",
         "-c:a", "copy",
-        output_video
+        tmp_output
     ]
 
     try:
         print(f"[PNG_OVERLAY] Dang chay FFmpeg overlay...")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        if os.path.exists(output_video):
+        if os.path.exists(tmp_output):
+            _commit()
             print(f"[PNG_OVERLAY] Hoan thanh: {os.path.basename(output_video)}")
             return True
         else:
             print(f"[PNG_OVERLAY] Loi: file output khong duoc tao.")
             return False
     except subprocess.CalledProcessError as e:
+        _cleanup()
         print(f"[PNG_OVERLAY] FFmpeg error: {e.stderr}")
         return False
     except Exception as e:
+        _cleanup()
         print(f"[PNG_OVERLAY] Loi: {e}")
         return False
 

@@ -94,8 +94,12 @@ def process_file(input_path, output_path, mood="tinh_cam"):
         else:
             final_lines.append(line + "\n")
 
-    with open(output_path, 'w', encoding='utf-8') as f:
+    tmp_path = output_path + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         f.writelines(final_lines)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, output_path)
 
     if collected_data:
         with open(dataset_path, 'a', encoding='utf-8') as f_data:

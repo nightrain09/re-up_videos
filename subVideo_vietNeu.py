@@ -9,10 +9,18 @@ import re
 import argparse
 import shutil
 import asyncio
+import hashlib
 import torch
 from datetime import datetime
 from pydub import AudioSegment
 from vieneu import Vieneu
+
+from utils.task_progress import (
+    empty_progress,
+    get_stage,
+    load_progress_file,
+    save_progress_file,
+)
 
 # =========================================================
 # --- CẤU HÌNH CỐ ĐỊNH (CHỈ GIỮ BIẾN LIÊN QUAN VIENEU) ---
@@ -96,23 +104,37 @@ def ms_to_ass_time(ms):
     return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _tts_part_path(path):
+    base, ext = os.path.splitext(path)
+    return f"{base}.tmp{ext}"
+
+
 async def generate_tts_safe(text, output_path, semaphore):
     async with semaphore:
         while True:
+            tmp_path = _tts_part_path(output_path)
             try:
                 loop = asyncio.get_event_loop()
                 audio = await loop.run_in_executor(None, lambda: tts_engine.infer(text=text, voice=ref_voice_data))
-                await loop.run_in_executor(None, lambda: tts_engine.save(audio, output_path))
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                await loop.run_in_executor(None, lambda: tts_engine.save(audio, tmp_path))
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    os.replace(tmp_path, output_path)
                     return True
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
                 await asyncio.sleep(2)
             except:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
                 await asyncio.sleep(2)
 
 
 def process_rvc_sub(task_dir, blur_sub, final_output_path, sub_file, speed, bgm,
                     blur_start_percent=80, blur_end_percent=95, blur_intensity=10,
-                    sub_background=True, has_subtitle=True):
+                    sub_background=True, has_subtitle=True, progress_file=None):
     task_dir = os.path.abspath(task_dir)
     video_in = os.path.join(task_dir, "original_video.mp4")
     txt_in = sub_file if sub_file else os.path.join(task_dir, "translated.txt")
@@ -124,11 +146,45 @@ def process_rvc_sub(task_dir, blur_sub, final_output_path, sub_file, speed, bgm,
     raw_p = os.path.join(task_dir, "raw_tmp_audio")
     os.makedirs(raw_p, exist_ok=True)
 
+    progress_file = progress_file or os.path.join(task_dir, "progress.json")
+    progress = load_progress_file(progress_file) or empty_progress()
+    render = get_stage(progress, "render")
+    subs_hash = hashlib.sha256((
+        "\n".join(f"{s['start_ms']}|{s['text']}" for s in subs)
+        + f"|VIENEU|{DVOICE_RATE}|{speed}"
+    ).encode("utf-8")).hexdigest()
+    if render.get("subs_hash") and render.get("subs_hash") != subs_hash:
+        print("[RESUME] Subtitle/voice thay doi -> tao lai TTS.")
+        shutil.rmtree(raw_p, ignore_errors=True)
+        os.makedirs(raw_p, exist_ok=True)
+        render.clear()
+    render["subs_hash"] = subs_hash
+    render["done"] = False
+    save_progress_file(progress_file, progress)
+
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    tasks = [generate_tts_safe(sub['text'], os.path.join(raw_p, f"{i}.wav"), semaphore) for i, sub in enumerate(subs)]
-    loop.run_until_complete(asyncio.gather(*tasks))
+    tts_done = set(render.get("tts_done") or [])
+    batch_size = 15
+    for start in range(0, len(subs), batch_size):
+        end = min(start + batch_size, len(subs))
+        tasks = []
+        for i in range(start, end):
+            path = os.path.join(raw_p, f"{i}.wav")
+            if os.path.exists(path) and os.path.getsize(path) > 100:
+                tts_done.add(i)
+                continue
+            tasks.append(generate_tts_safe(subs[i]['text'], path, semaphore))
+        if tasks:
+            loop.run_until_complete(asyncio.gather(*tasks))
+        for i in range(start, end):
+            path = os.path.join(raw_p, f"{i}.wav")
+            if os.path.exists(path) and os.path.getsize(path) > 100:
+                tts_done.add(i)
+        render["tts_done"] = sorted(tts_done)
+        render["tts_total"] = len(subs)
+        save_progress_file(progress_file, progress)
 
     video_dur = get_video_duration(video_in)
     combined_voice = AudioSegment.silent(duration=int(video_dur * 1000), frame_rate=SAMPLE_RATE)
@@ -228,7 +284,9 @@ def process_rvc_sub(task_dir, blur_sub, final_output_path, sub_file, speed, bgm,
             os.remove(p)
 
     if os.path.exists(video_tmp):
-        shutil.move(video_tmp, final_output_path)
+        os.replace(video_tmp, final_output_path)
+        render["done"] = True
+        save_progress_file(progress_file, progress)
         return True
     return False
 
@@ -244,8 +302,12 @@ if __name__ == "__main__":
     parser.add_argument("--tts_engine", default="VIENEU")
     parser.add_argument("--sub_background", default="True", help="Bật/tắt nền phụ đề (True/False)")
     parser.add_argument("--has_subtitle", default="True", help="Co chay TTS+chen phu de hay khong (True/False)")
-    args = parser.parse_args()
+    parser.add_argument("--progress", default=None, help="File progress.json cua task")
+    # MainController truyền chung nhiều tham số cho mọi render script; VieNeu
+    # không dùng hết, nên bỏ qua các arg lạ thay vì lỗi argparse.
+    args, _ = parser.parse_known_args()
     sub_bg = args.sub_background.lower() in ("true", "1", "yes")
     has_subtitle = args.has_subtitle.lower() in ("true", "1", "yes")
     process_rvc_sub(args.task_dir, args.blur, args.output, args.sub, args.speed, args.bgm,
-                    sub_background=sub_bg, has_subtitle=has_subtitle)
+                    sub_background=sub_bg, has_subtitle=has_subtitle,
+                    progress_file=args.progress)
