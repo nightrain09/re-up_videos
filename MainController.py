@@ -109,46 +109,177 @@ class MainController:
         else:
             return "https://j2download.com"
 
+    # --- Helper cho j2download ---
+    @staticmethod
+    def _is_youtube_url(url):
+        return "youtube.com" in url or "youtu.be" in url
+
+    @staticmethod
+    def _collect_urls(obj, key=""):
+        """Duyet de quy JSON/chuoi, tra ve danh sach (ten_khoa, url)."""
+        found = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                found += MainController._collect_urls(v, str(k))
+        elif isinstance(obj, list):
+            for v in obj:
+                found += MainController._collect_urls(v, key)
+        elif isinstance(obj, str):
+            for u in re.findall(r"https?://[^\s\"'\\<>]+", obj):
+                found.append((key, u))
+        return found
+
+    def _resolve_j2_stream(self, resp, stream_url):
+        """j2 (YouTube) tra ve text/event-stream: doc su kien den het, lay link file that."""
+        resp.encoding = "utf-8"
+        raw_lines, candidates = [], []
+        printed = 0
+        for raw in resp.iter_lines(decode_unicode=True):
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            line = (raw or "").strip()
+            if not line:
+                continue
+            raw_lines.append(line)
+            if printed < 40:
+                print(f"      SSE: {line[:200]}")
+                printed += 1
+                if printed == 40:
+                    print("      SSE: ... (an bot cac dong tiep theo)")
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            try:
+                obj = json.loads(payload)
+            except ValueError:
+                obj = payload
+            if isinstance(obj, dict):
+                status = str(obj.get("status", "")).lower()
+                if obj.get("error") or status in ("error", "failed"):
+                    raise RuntimeError(f"j2 bao loi trong luong su kien: {str(obj)[:400]}")
+            for k, u in self._collect_urls(obj):
+                if u == stream_url or u.lower().split("?")[0].endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                    continue
+                candidates.append((k, u))
+
+        print(f"   Luong su kien: {len(raw_lines)} dong, {len(candidates)} link ung vien")
+        if not candidates:
+            tail = "\n".join(raw_lines[-8:])[:1500]
+            raise RuntimeError(f"Khong tim thay link file trong luong su kien. 8 dong cuoi:\n{tail}")
+
+        good = [u for k, u in candidates if re.search(r"download|file|url|link|result", k, re.I)]
+        return (good or [u for _, u in candidates])[-1]
+
+    @staticmethod
+    def _j2_height(media):
+        found = re.search(r"(\d{3,4})\s*p", str(media.get("quality", "")), re.I)
+        return int(found.group(1)) if found else 0
+
+    def _pick_j2_media(self, medias, url):
+        """Chon 1 ban video. YouTube: cao nhat <= 1080p. Site khac: giu logic cu."""
+        videos = [m for m in medias if m.get("type") == "video" and m.get("url")]
+        if self._is_youtube_url(url):
+            ok = [m for m in videos if 0 < self._j2_height(m) <= 1080]
+            if ok:
+                return max(ok, key=self._j2_height)
+            return videos[0] if videos else None
+        # Douyin / TikTok / Facebook: giu nguyen logic cu
+        return (next((m for m in medias if m.get("quality") == "HD No Watermark"),
+                     next((m for m in medias if m.get("quality") == "No Watermark"),
+                          next((m for m in medias if m.get("type") == "video"), None))))
+
+    def _fetch_j2_file(self, video_url, output_path, headers=None):
+        """Tai file tu link j2. Neu link la event-stream thi doc luong de lay link file that."""
+        file_url = video_url
+        for _ in range(2):
+            with requests.get(file_url, stream=True, timeout=(15, 300), headers=headers) as response:
+                ctype = response.headers.get("Content-Type", "")
+                print(f"   Tai: HTTP {response.status_code} | type={ctype} | size={response.headers.get('Content-Length', '?')}")
+                response.raise_for_status()
+
+                if "event-stream" in ctype:
+                    print("   j2 dang xu ly video, cho link file that...")
+                    file_url = self._resolve_j2_stream(response, file_url)
+                    print(f"   Link file that: {file_url[:120]}")
+                    continue
+
+                if "text/html" in ctype:
+                    raise RuntimeError(f"Link tra ve trang web, khong phai video: {response.text[:300]!r}")
+
+                with open(output_path, "wb") as output_file:
+                    for chunk in response.iter_content(chunk_size=1024 * 256):
+                        output_file.write(chunk)
+                size = os.path.getsize(output_path)
+                print(f"   Tai xong: {size / 1048576:.1f} MB")
+                if size < 8192:
+                    with open(output_path, "r", encoding="utf-8", errors="replace") as fh:
+                        print(f"   File rat nho, noi dung: {fh.read(600)!r}")
+                return
+        raise RuntimeError("j2 tra ve event-stream 2 lan lien tiep, khong lay duoc file")
+
+    # So lan thu lai khi tai qua j2. YouTube: 0 = thu lai vo han cho den khi tai duoc.
+    J2_YT_MAX_ATTEMPTS = 10      # YouTube: so lan thu toi da (0 = vo han)
+    J2_OTHER_MAX_ATTEMPTS = 10   # Douyin/TikTok/Facebook: so lan thu toi da (0 = vo han)
+    J2_RETRY_DELAY = 2  # giay nghi giua cac lan thu
+
     def _download_via_j2download(self, url, output_path, j2_site):
-        """Tai video tu j2download bang Playwright."""
+        """Tai video tu j2download bang Playwright (YouTube: j2 tra event-stream)."""
+        is_yt = self._is_youtube_url(url)
+        max_attempts = self.J2_YT_MAX_ATTEMPTS if is_yt else self.J2_OTHER_MAX_ATTEMPTS
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": j2_site,
+        } if is_yt else None
+
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-                page = context.new_page()
-                for attempt in range(10):
-                    video_url = None
-                    try:
-                        page.goto(j2_site, wait_until="networkidle")
-                        page.fill('input[id="url"]', url)
-                        page.wait_for_timeout(500)
-                        with page.expect_response("**/api/autolink", timeout=15000) as response_info:
-                            page.click('button[type="submit"]')
-                        video_data = response_info.value.json()
-                        if not video_data.get("error"):
-                            medias = video_data.get("medias", [])
-                            target = next((m for m in medias if m.get("quality") == "HD No Watermark"),
-                                          next((m for m in medias if m.get("quality") == "No Watermark"),
-                                               next((m for m in medias if m.get("type") == "video"), None)))
-                            if target:
-                                video_url = target["url"]
+                try:
+                    context = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    )
+                    page = context.new_page()
+                    attempt = 0
+                    while max_attempts == 0 or attempt < max_attempts:
+                        attempt += 1
+                        label = f"lan {attempt}" if max_attempts == 0 else f"lan {attempt}/{max_attempts}"
+                        step = "mo trang j2"
+                        try:
+                            page.goto(j2_site, wait_until="networkidle")
+                            step = "nhap link"
+                            page.fill('input[id="url"]', url)
+                            page.wait_for_timeout(500)
+                            step = "lay /api/autolink"
+                            with page.expect_response("**/api/autolink", timeout=15000) as response_info:
+                                page.click('button[type="submit"]')
+                            video_data = response_info.value.json()
+                            if video_data.get("error"):
+                                print(f"J2 bao loi ({j2_site}, {label}): {video_data.get('error')}")
+                                time.sleep(self.J2_RETRY_DELAY)
+                                continue
 
-                        if video_url:
-                            with requests.get(video_url, stream=True, timeout=120) as response:
-                                response.raise_for_status()
-                                with open(output_path, "wb") as output_file:
-                                    for chunk in response.iter_content(chunk_size=8192):
-                                        output_file.write(chunk)
+                            medias = video_data.get("medias", [])
+                            if attempt == 1:
+                                print("   J2 tra ve: " + ", ".join(
+                                    f"{m.get('type')}/{m.get('quality')}" for m in medias))
+                            target = self._pick_j2_media(medias, url)
+                            if not target:
+                                print(f"J2 khong co ban video phu hop ({label})")
+                                time.sleep(self.J2_RETRY_DELAY)
+                                continue
+
+                            print(f"   Chon: {target.get('quality')}")
+                            step = "tai file"
+                            self._fetch_j2_file(target["url"], output_path, headers)
                             if os.path.exists(output_path):
-                                browser.close()
                                 return True
-                    except Exception as e:
-                        print(f"J2 loi ({j2_site}, lan {attempt + 1}/10): {e}")
-                browser.close()
+                        except Exception as e:
+                            print(f"J2 loi o buoc [{step}] ({j2_site}, {label}): {type(e).__name__}: {e}")
+                        time.sleep(self.J2_RETRY_DELAY)
+                finally:
+                    browser.close()
         except Exception as e:
-            print(f"Loi J2 Playwright: {e}")
+            print(f"Loi J2 Playwright: {type(e).__name__}: {e}")
         return False
 
     # === SEEKIN.AI CŨ (ĐÃ COMMENT, GIỮ LẠI ĐỂ THAM KHẢO) ===
